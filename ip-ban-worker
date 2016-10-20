@@ -1,0 +1,100 @@
+#!/bin/bash
+
+set -u
+
+PATH="/bin:/usr/bin"
+
+# TODO: Rework to use ip-ban-cli (or other API)
+function set_task_queue_status() {
+	local new_status="$1"
+	local queue_id="$2"
+	local ban_id="$3"
+	local server_id="$4"
+	local updated
+
+	local query="UPDATE ip_ban.queue SET status='$new_status' WHERE id=$queue_id AND ban_id=$ban_id AND server_id=$server_id; SELECT ROW_COUNT();"
+
+	updated=$(echo "$query" |mysql --defaults-file=ip-ban-worker-mysql.cnf --skip-column-names --host=sg-kvm --user=ip-ban-api)
+
+	if [ "$updated" != "1" ]; then
+		echo "DEBUG: updated = $updated" >&2
+		echo "ABORT: Failed to set task status to [$new_status]. No such task in queue or already taken by another worker?" >&2
+		exit 1
+	fi
+
+	query="UPDATE ip_ban.queue SET pid=$$ WHERE id=$queue_id AND ban_id=$ban_id AND server_id=$server_id";
+	echo "$query" |mysql --defaults-file=ip-ban-worker-mysql.cnf --skip-column-names --host=sg-kvm --user=ip-ban-api
+}
+
+function adjust_task_queue_retry() {
+	local old_status="$1"
+	local queue_id="$2"
+	local ban_id="$3"
+	local server_id="$4"
+
+	local query="UPDATE ip_ban.queue SET retry=retry+60 WHERE id=$queue_id AND ban_id=$ban_id AND server_id=$server_id and status='R'; SELECT ROW_COUNT();"
+
+	updated=$(echo "$query" |mysql --defaults-file=ip-ban-worker-mysql.cnf --skip-column-names --host=sg-kvm --user=ip-ban-api)
+
+	if [ "$updated" != "1" ]; then
+		echo "DEBUG: updated = $updated" >&2
+		echo "ABORT: Failed to set task retry time for queue id [$queue_id]." >&2
+		exit 1
+	fi
+}
+
+function remove_task_from_queue() {
+	local queue_id="$1"
+	local ban_id="$2"
+	local server_id="$3"
+	local deleted
+
+	local query="DELETE FROM ip_ban.queue WHERE id=$queue_id AND ban_id=$ban_id AND server_id=$server_id; SELECT ROW_COUNT();"
+
+	deleted=$(echo "$query" |mysql --defaults-file=ip-ban-worker-mysql.cnf --skip-column-names --host=sg-kvm --user=ip-ban-api)
+
+	if [ "$deleted" != 1 ]; then
+		echo "ERROR: too few or many rows where deleted [$deleted]"
+		exit 1
+	fi
+}
+
+function ssh_apply_ban() {
+	local server="$1"
+	local subnet="$2"
+
+	local ec
+sleep 10
+	ssh -i ip-ban-ssh.rsa -oBatchMode=yes "$server" "echo sudo iptables -A INPUT -s $subnet -j DROP"
+	ec=$?
+
+	if [ $ec != "0" ]; then
+		echo "ssh error code: $ec"
+	fi
+
+	return $ec
+}
+
+function main() {
+	while read line; do
+		local queue_id
+		local ban_id
+		local server_id
+		local server
+		local subnet
+		
+		read queue_id ban_id server_id server subnet <<< $line
+		
+		set_task_queue_status "R" "$queue_id" "$ban_id" "$server_id"
+		echo "queue.id $queue_id accepted"
+		
+		if ssh_apply_ban "$server" "$subnet"; then
+			remove_task_from_queue "$queue_id" "$ban_id" "$server_id"
+		else
+			adjust_task_queue_retry "R" "$queue_id" "$ban_id" "$server_id"
+			set_task_queue_status "F" "$queue_id" "$ban_id" "$server_id"
+		fi
+	done < <(cat)
+}
+
+main

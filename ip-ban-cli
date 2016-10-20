@@ -1,0 +1,173 @@
+#!/usr/bin/perl -T
+
+use strict;
+use warnings;
+
+use Carp;
+use English qw( -no_match_vars );
+use Data::Dumper;
+
+use Getopt::Long;
+
+use lib 'lib';
+use IP::Ban;
+
+
+sub usage {
+	my $ec = shift // 1;
+
+	open(STDOUT, '>&', STDERR) || croak("$OS_ERROR");
+
+	print "Usage:  ip-ban-cli <command> [options]\n";
+	print "\n";
+	print "<command> is one of: ban, unban, runq, summary, list, count\n";
+	print "\n";
+	print "ban/unban options:\n";
+	print "\t--subnet (single IP is /32)\n";
+	print "\t--target list of servers to apply ban (default: \@all)\n";
+	print "\t--ttl    how many seconds to keep the ban (not yet implemented)\n";
+	print "list/count options:\n";
+	print "\t--queue\n";
+	print "\t--failed\n";
+	print "\n";
+	print "Example:  ip-ban-cli ban --subnet 10.9.8.7/32 --target s101.example.com\n\n";
+
+	exit $ec;
+}
+
+sub ban {
+	my $opts_ref = shift;
+	my $subnet;
+	my $mask;
+
+	if (!$opts_ref->{'subnet'}) {
+		printf(STDERR "--subnet is required with ban command.\n\n");
+		usage();
+	}
+
+	($subnet, $mask) = split("/", $opts_ref->{'subnet'});
+
+	if (!$subnet || !$mask) {
+		printf(STDERR "Invalid subnet format: [%s].\n\n", $opts_ref->{'subnet'});
+		usage();
+	}
+
+	return IP::Ban::ban($subnet, $mask, $opts_ref->{'target'}, $opts_ref->{'ttl'});
+}
+
+sub unban {
+	my $opts_ref = shift;
+
+	croak('Not implemented yet');
+}
+
+sub list_bans {
+	my $bans_ref = IP::Ban::get_bans();
+
+    printf("%5s  %18s  %18s  %19s  %19s  %19s\n", "id", "subnet", "target", "expires", "updated", "created");
+	foreach my $row_ref (@${bans_ref}) {
+		printf("%5d  %18s  %18s  %19s  %19s  %19s\n",
+			$row_ref->{'id'}, $row_ref->{'subnet'}, $row_ref->{'target'},
+			$row_ref->{'expires'} ? $row_ref->{'expires'} : "never",
+			$row_ref->{'updated'}, $row_ref->{'created'});
+
+	}
+
+	return;
+}
+
+sub list_queue {
+	my $status = shift;
+
+	if ($status && $status ne 'F') {
+		croak("Internal error: unknown status [$status].");
+	}
+
+	my $queue_ref = IP::Ban::get_queue($status);
+
+	printf("%5s  %18s  %18s  %6s  %6s  %19s  %19s  %6s\n", "id", "subnet", "target",
+		"task", "status", "updated", "created", "retry");
+
+	foreach my $row_ref (@{$queue_ref}) {
+		printf("%5s  %18s  %18s  %6s  %6s  %19s  %19s  %6s\n",
+			$row_ref->{'id'},      $row_ref->{'subnet'}, $row_ref->{'target'},
+			$row_ref->{'task'},    $row_ref->{'status'}, $row_ref->{'updated'},
+			$row_ref->{'created'}, $row_ref->{'retry'} ? $row_ref->{'retry'} : "-");
+	}
+
+	return;
+}
+
+sub list {
+	my $opts_ref = shift;
+
+	for my $opt_k (keys %{$opts_ref}) {
+		next if (!defined($opts_ref->{$opt_k}));
+		next if ($opt_k eq "queue");
+		next if ($opt_k eq "failed");
+
+		printf(STDERR "Option %s not valid with list command\n\n", $opt_k);
+		usage();
+	}
+
+	if (!$opts_ref->{'queue'} && $opts_ref->{'failed'}) {
+		printf('--failed is valid only with list --queue');
+		usage();
+	}
+
+	if (!$opts_ref->{'queue'} && !$opts_ref->{'failed'}) {
+		return list_bans();
+	}
+
+	if ($opts_ref->{'queue'} && !$opts_ref->{'failed'}) {
+		return list_queue();
+	}
+
+	if ($opts_ref->{'queue'} && $opts_ref->{'failed'}) {
+		return list_queue("F");
+	}
+
+	croak('Internal error.');
+}
+
+sub runq {
+	return IP::Ban::run_queue();
+}
+
+sub main {
+	my $opts_ref = {};
+
+	GetOptions(
+		"help"      => \$opts_ref->{'help'},
+		"subnet=s"  => \$opts_ref->{'subnet'},
+		"target=s"  => \$opts_ref->{'target'},
+		"ttl=s"     => \$opts_ref->{'ttl'},
+		"queue"     => \$opts_ref->{'queue'},
+		"failed"    => \$opts_ref->{'failed'},
+	) or usage();
+
+	if ($opts_ref->{'help'}) {
+		usage(0);
+	}
+
+	if (1 == scalar @ARGV) {
+		if ("ban" eq $ARGV[0]) {
+			ban($opts_ref);
+		} elsif ("unban" eq $ARGV[0]) {
+			unban($opts_ref);
+		} elsif ("list" eq $ARGV[0]) {
+			list($opts_ref);
+		} elsif ("runq" eq $ARGV[0]) {
+			runq();
+		} else {
+			printf(STDERR "Unknown command [%s]\n", $ARGV[0]);
+			usage();
+		}
+	} else {
+		usage();
+	}
+
+	return;
+}
+
+main();
